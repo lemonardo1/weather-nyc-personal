@@ -38,6 +38,8 @@ struct Forecast: Codable {
     let windUnit: String
     let precipitationUnit: String
     let hours: [HourPoint]
+    /// Model run time for forecasts loaded from the single-runs archive (backfill); nil for live fetches.
+    var modelRun: Date? = nil
 }
 
 extension Forecast {
@@ -53,7 +55,8 @@ extension Forecast {
                           rain: $0.rain.map(p.fromMm),
                           weatherCode: $0.weatherCode,
                           isDay: $0.isDay)
-            }
+            },
+            modelRun: modelRun
         )
     }
 
@@ -65,7 +68,8 @@ extension Forecast {
             fetchedAt: fetchedAt, latitude: latitude, longitude: longitude, elevation: elevation,
             generationMs: generationMs, downloadMs: downloadMs, timeZoneAbbreviation: timeZoneAbbreviation,
             temperatureUnit: temperatureUnit, windUnit: windUnit, precipitationUnit: precipitationUnit,
-            hours: reference.hours.map { byDate[$0.date] ?? $0 }
+            hours: reference.hours.map { byDate[$0.date] ?? $0 },
+            modelRun: modelRun
         )
     }
 }
@@ -126,20 +130,38 @@ private struct OpenMeteoResponse: Decodable {
 }
 
 enum WeatherService {
-    static let url: URL = {
-        var c = URLComponents(string: "https://api.open-meteo.com/v1/forecast")!
-        c.queryItems = [
-            .init(name: "latitude", value: String(Location.latitude)),
-            .init(name: "longitude", value: String(Location.longitude)),
-            .init(name: "hourly", value: "temperature_2m,wind_speed_10m,rain,weather_code,is_day"),
-            .init(name: "timezone", value: Location.timeZone.identifier),
-            .init(name: "past_days", value: "1"),
-            .init(name: "forecast_days", value: "7"),
-        ]
-        return c.url!
-    }()
+    /// NOAA National Blend of Models: updated hourly, 7+ days, and its past runs are archived
+    /// (every 3 h) by Open-Meteo's single-runs API, so playback compares like with like.
+    static let model = "ncep_nbm_conus"
 
+    private static let commonQuery: [URLQueryItem] = [
+        .init(name: "latitude", value: String(Location.latitude)),
+        .init(name: "longitude", value: String(Location.longitude)),
+        .init(name: "hourly", value: "temperature_2m,wind_speed_10m,rain,weather_code,is_day"),
+        .init(name: "models", value: model),
+        .init(name: "timezone", value: Location.timeZone.identifier),
+        .init(name: "forecast_days", value: "7"),
+    ]
+
+    /// Latest forecast.
     static func fetch() async throws -> Forecast {
+        var c = URLComponents(string: "https://api.open-meteo.com/v1/forecast")!
+        c.queryItems = commonQuery + [.init(name: "past_days", value: "1")]
+        return try await load(c.url!, fetchedAt: Date(), modelRun: nil)
+    }
+
+    /// A past model run from the archive. Its `fetchedAt` is the run time.
+    static func fetchRun(_ run: Date) async throws -> Forecast {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.timeZone = TimeZone(identifier: "UTC")
+        f.dateFormat = "yyyy-MM-dd'T'HH:mm"
+        var c = URLComponents(string: "https://single-runs-api.open-meteo.com/v1/forecast")!
+        c.queryItems = commonQuery + [.init(name: "run", value: f.string(from: run))]
+        return try await load(c.url!, fetchedAt: run, modelRun: run)
+    }
+
+    private static func load(_ url: URL, fetchedAt: Date, modelRun: Date?) async throws -> Forecast {
         let clock = ContinuousClock()
         let start = clock.now
         let (data, response) = try await URLSession.shared.data(from: url)
@@ -170,7 +192,7 @@ enum WeatherService {
         let ms = Double(elapsed.components.seconds) * 1000
             + Double(elapsed.components.attoseconds) / 1e15
         return Forecast(
-            fetchedAt: Date(),
+            fetchedAt: fetchedAt,
             latitude: r.latitude,
             longitude: r.longitude,
             elevation: r.elevation,
@@ -180,7 +202,8 @@ enum WeatherService {
             temperatureUnit: TemperatureUnit.celsius.label,
             windUnit: WindUnit.kmh.label,
             precipitationUnit: PrecipitationUnit.mm.label,
-            hours: hours
+            hours: hours,
+            modelRun: modelRun
         )
     }
 }

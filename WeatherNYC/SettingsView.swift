@@ -35,7 +35,7 @@ struct SettingsView: View {
 
                 Section {
                     LabeledContent("위치", value: Location.name)
-                    LabeledContent("데이터", value: "Open-Meteo")
+                    LabeledContent("데이터", value: "Open-Meteo · NBM")
                 }
             }
             .navigationTitle("설정")

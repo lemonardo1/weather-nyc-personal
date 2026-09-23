@@ -146,6 +146,7 @@ struct ContentView: View {
             SnapshotStore.save(fresh)
             forecast = fresh
             error = nil
+            Task.detached(priority: .utility) { await SnapshotStore.backfill() }
         } catch {
             if forecast == nil { self.error = error.localizedDescription }
         }
@@ -155,19 +156,23 @@ struct ContentView: View {
 
     private func startPlayback() {
         guard let current = forecast else { return }
-        let history = SnapshotStore.history(before: current)
-
         playTask = Task {
             defer { playTask = nil }
-            guard !history.isEmpty else {
-                withAnimation { playbackLabel = "저장된 과거 예보가 아직 없어요" }
+            var history = SnapshotStore.history(before: current)
+            if history.count < 3 {
+                withAnimation { playbackLabel = "과거 예보 불러오는 중…" }
+                await SnapshotStore.backfill()
+                history = SnapshotStore.history(before: current)
+            }
+            guard !history.isEmpty, !Task.isCancelled else {
+                withAnimation { playbackLabel = "과거 예보를 불러오지 못했어요" }
                 try? await Task.sleep(for: .seconds(2))
                 withAnimation { playbackLabel = nil }
                 return
             }
 
-            let frames = history.map { ($0.forecast.aligned(to: current), Self.label(hoursAgo: $0.hoursAgo, $0.forecast)) }
-                + [(current, Self.label(hoursAgo: 0, current))]
+            let frames = history.map { ($0.aligned(to: current), Self.label($0, relativeTo: current)) }
+                + [(current, Self.label(current, relativeTo: current))]
 
             // Jump to the oldest frame without animating, then morph forward.
             playbackFrames = frames.map(\.0)
@@ -201,10 +206,12 @@ struct ContentView: View {
         }
     }
 
-    private static func label(hoursAgo: Int, _ f: Forecast) -> String {
+    private static func label(_ f: Forecast, relativeTo current: Forecast) -> String {
         let time = f.fetchedAt.formatted(.dateTime.hour(.twoDigits(amPM: .omitted)).minute()
             .locale(Locale(identifier: "en_GB")))
-        return hoursAgo == 0 ? "현재 · \(time) 수집" : "\(hoursAgo)시간 전 · \(time) 수집"
+        let hoursAgo = Int((current.fetchedAt.timeIntervalSince(f.fetchedAt) / 3600).rounded())
+        let source = f.modelRun != nil ? "\(time) 모델 런" : "\(time) 수집"
+        return hoursAgo == 0 ? "현재 · \(source)" : "\(hoursAgo)시간 전 · \(source)"
     }
 }
 
