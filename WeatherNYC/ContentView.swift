@@ -9,8 +9,9 @@ struct ContentView: View {
     /// Snapshot currently shown during playback (nil = live forecast).
     @State private var playbackFrame: Forecast?
     @State private var playbackLabel: String?
-    /// All frames of the running playback; the chart fits its axes to these so they don't jump between frames.
-    @State private var playbackFrames: [Forecast] = []
+    /// Past snapshots aligned to the live forecast. The chart always fits its axes to these as well,
+    /// so axes stay put when playback starts, morphs and ends.
+    @State private var historyFrames: [Forecast] = []
     @State private var playTask: Task<Void, Never>?
     private var isPlaying: Bool { playTask != nil }
 
@@ -54,7 +55,7 @@ struct ContentView: View {
                 }
                 VStack(spacing: 10) {
                     ForecastChart(forecast: convert(playbackFrame ?? forecast), visible: visibleMetrics,
-                                  scaleAlso: playbackFrames.map(convert))
+                                  scaleAlso: historyFrames.map(convert))
                     Legend(visible: visibleMetrics)
                 }
                 .padding(.horizontal, 8)
@@ -146,7 +147,11 @@ struct ContentView: View {
             SnapshotStore.save(fresh)
             forecast = fresh
             error = nil
-            Task.detached(priority: .utility) { await SnapshotStore.backfill() }
+            refreshHistory()
+            Task {
+                await SnapshotStore.backfill()
+                withAnimation { refreshHistory() }
+            }
         } catch {
             if forecast == nil { self.error = error.localizedDescription }
         }
@@ -158,12 +163,12 @@ struct ContentView: View {
         guard let current = forecast else { return }
         playTask = Task {
             defer { playTask = nil }
-            var history = SnapshotStore.history(before: current)
-            if history.count < 3 {
+            if historyFrames.count < 3 {
                 withAnimation { playbackLabel = "과거 예보 불러오는 중…" }
                 await SnapshotStore.backfill()
-                history = SnapshotStore.history(before: current)
+                withAnimation { refreshHistory() }
             }
+            let history = SnapshotStore.history(before: current)
             guard !history.isEmpty, !Task.isCancelled else {
                 withAnimation { playbackLabel = "과거 예보를 불러오지 못했어요" }
                 try? await Task.sleep(for: .seconds(2))
@@ -174,10 +179,11 @@ struct ContentView: View {
             let frames = history.map { ($0.aligned(to: current), Self.label($0, relativeTo: current)) }
                 + [(current, Self.label(current, relativeTo: current))]
 
-            // Jump to the oldest frame without animating, then morph forward.
-            playbackFrames = frames.map(\.0)
-            playbackFrame = frames[0].0
-            withAnimation { playbackLabel = frames[0].1 }
+            // Rewind to the oldest frame, then morph forward to now.
+            withAnimation(.easeInOut(duration: 0.6)) {
+                playbackFrame = frames[0].0
+                playbackLabel = frames[0].1
+            }
             for (frame, label) in frames.dropFirst() {
                 try? await Task.sleep(for: .seconds(1.6))
                 if Task.isCancelled { return }
@@ -188,10 +194,10 @@ struct ContentView: View {
             }
             try? await Task.sleep(for: .seconds(1.5))
             if Task.isCancelled { return }
+            // The last frame is the live forecast, so clearing it changes nothing on the chart.
             withAnimation {
                 playbackFrame = nil
                 playbackLabel = nil
-                playbackFrames = []
             }
         }
     }
@@ -199,11 +205,15 @@ struct ContentView: View {
     private func stopPlayback() {
         playTask?.cancel()
         playTask = nil
-        withAnimation {
+        withAnimation(.easeInOut(duration: 0.6)) {
             playbackFrame = nil
             playbackLabel = nil
-            playbackFrames = []
         }
+    }
+
+    private func refreshHistory() {
+        guard let current = forecast else { return }
+        historyFrames = SnapshotStore.history(before: current).map { $0.aligned(to: current) }
     }
 
     private static func label(_ f: Forecast, relativeTo current: Forecast) -> String {
